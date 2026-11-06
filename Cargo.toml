@@ -5,9 +5,15 @@ edition = "2024"
 description = "Requirements explorer: 150k XML requirements with HTML-in-CDATA, rendered with GPUI"
 
 [dependencies]
-gpui = "0.2.2"
+gpui = { package = "gpui-pre", version = "=0.3.11" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11" }
+gpui-component = { version = "0.9", features = ["tree-sitter-html"] }
+gpui-kit-assets = "0.9"
 quick-xml = "0.37"
 rayon = "1.10"
+similar = "2.7"
+tree-sitter = "0.26"
+tree-sitter-xml = "0.7"
 
 [profile.dev]
 opt-level = 1

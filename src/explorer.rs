@@ -6,10 +6,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui::{ListAlignment, ListOffset, ListState, ScrollStrategy, UniformListScrollHandle, px};
+use gpui::{ListAlignment, ListOffset, ListState, ScrollStrategy, SharedString, UniformListScrollHandle, px};
 use rayon::prelude::*;
 
-use crate::data::Dataset;
+use crate::data::{self, Dataset, Req, xml};
 use crate::html::{self, Block};
 
 const BODY_CACHE: usize = 96;
@@ -21,6 +21,18 @@ pub struct Body {
     pub html_bytes: usize,
     pub parse_time: Duration,
     pub error: Option<String>,
+}
+
+/// An in-memory edit of one requirement (the POC never writes back to the source).
+pub struct Edit {
+    /// The document as the source has it.
+    pub original: String,
+    /// The saved, edited document.
+    pub xml: String,
+    /// Metadata re-parsed from `xml`, shown in the table instead of the indexed values.
+    pub req: Req,
+    pub owner: SharedString,
+    pub search_key: Box<str>,
 }
 
 pub struct Explorer {
@@ -38,6 +50,9 @@ pub struct Explorer {
     pub query: String,
     pub status_filter: Option<u8>,
     pub filter_time: Duration,
+    pub edited_only: bool,
+    // edits
+    pub edits: HashMap<u32, Edit>,
     // bodies
     bodies: HashMap<u32, Rc<Body>>,
     lru: VecDeque<u32>,
@@ -65,6 +80,8 @@ impl Explorer {
             query: String::new(),
             status_filter: None,
             filter_time: Duration::ZERO,
+            edited_only: false,
+            edits: HashMap::new(),
             bodies: HashMap::new(),
             lru: VecDeque::new(),
         };
@@ -132,16 +149,25 @@ impl Explorer {
         let t0 = Instant::now();
         let q = self.query.trim().to_lowercase();
         let status = self.status_filter;
+        let edited_only = self.edited_only;
         let ds = &self.ds;
-        self.rows = if q.is_empty() && status.is_none() {
+        let edits = &self.edits;
+        self.rows = if q.is_empty() && status.is_none() && !edited_only {
             ds.order.clone()
         } else {
             ds.order
                 .par_iter()
                 .copied()
                 .filter(|&n| {
-                    status.is_none_or(|s| ds.reqs[n as usize].status == s)
-                        && (q.is_empty() || ds.search_key[n as usize].contains(q.as_str()))
+                    let edit = edits.get(&n);
+                    if edited_only && edit.is_none() {
+                        return false;
+                    }
+                    let (req_status, key) = match edit {
+                        Some(e) => (e.req.status, &e.search_key),
+                        None => (ds.reqs[n as usize].status, &ds.search_key[n as usize]),
+                    };
+                    status.is_none_or(|s| req_status == s) && (q.is_empty() || key.contains(q.as_str()))
                 })
                 .collect()
         };
@@ -207,6 +233,84 @@ impl Explorer {
         self.list.scroll_to_reveal_item(ix);
     }
 
+    // --------------------------------------------------------------- edits
+
+    /// Table metadata for `node`: the edited version if there is one.
+    pub fn req(&self, node: u32) -> &Req {
+        match self.edits.get(&node) {
+            Some(e) => &e.req,
+            None => &self.ds.reqs[node as usize],
+        }
+    }
+
+    pub fn owner(&self, node: u32) -> SharedString {
+        match self.edits.get(&node) {
+            Some(e) => e.owner.clone(),
+            None => self.ds.owners[self.ds.reqs[node as usize].owner as usize].clone(),
+        }
+    }
+
+    pub fn is_edited(&self, node: u32) -> bool {
+        self.edits.contains_key(&node)
+    }
+
+    /// The document as the source has it, ignoring edits.
+    pub fn original_xml(&self, node: u32) -> Result<String, String> {
+        match self.edits.get(&node) {
+            Some(e) => Ok(e.original.clone()),
+            None => self.ds.source.read(node as usize),
+        }
+    }
+
+    /// The document including saved edits.
+    pub fn current_xml(&self, node: u32) -> Result<String, String> {
+        match self.edits.get(&node) {
+            Some(e) => Ok(e.xml.clone()),
+            None => self.ds.source.read(node as usize),
+        }
+    }
+
+    /// Stores an edited document. Saving the original text back removes the edit.
+    pub fn save_edit(&mut self, node: u32, new_xml: String) -> Result<(), String> {
+        let original = self.original_xml(node)?;
+        if new_xml == original {
+            self.revert(node);
+            return Ok(());
+        }
+        let p = xml::parse(&new_xml, false)?;
+        let base = &self.ds.reqs[node as usize];
+        let req = Req {
+            id: p.id.clone().into(),
+            title: p.title.clone().into(),
+            kind: p.kind.clone().into(),
+            status: data::status_ix(&p.status),
+            priority: data::priority_ix(&p.priority),
+            owner: base.owner,
+            version: p.version,
+            updated: p.updated.clone().into(),
+            html_len: p.html_len as u32,
+        };
+        let search_key = format!("{} {}", p.id, p.title).to_lowercase().into_boxed_str();
+        self.edits.insert(node, Edit { original, xml: new_xml, req, owner: p.owner.into(), search_key });
+        self.after_edit(node);
+        Ok(())
+    }
+
+    pub fn revert(&mut self, node: u32) {
+        if self.edits.remove(&node).is_some() {
+            self.after_edit(node);
+        }
+    }
+
+    fn after_edit(&mut self, node: u32) {
+        self.bodies.remove(&node);
+        self.lru.retain(|&n| n != node);
+        if self.expanded.contains(&node) {
+            self.body(node);
+        }
+        self.remeasure(node);
+    }
+
     // -------------------------------------------------------------- bodies
 
     pub fn body(&mut self, node: u32) -> Rc<Body> {
@@ -216,7 +320,10 @@ impl Explorer {
         let t0 = Instant::now();
         let id = self.ds.reqs[node as usize].id.clone();
         let file = self.ds.source.file_name(node as usize, &id);
-        let body = match self.ds.load_body(node) {
+        let loaded = self
+            .current_xml(node)
+            .and_then(|x| xml::parse(&x, true).map(|p| (p, x.len())));
+        let body = match loaded {
             Ok((parsed, xml_bytes)) => {
                 let blocks = html::to_blocks(&parsed.html);
                 Body {

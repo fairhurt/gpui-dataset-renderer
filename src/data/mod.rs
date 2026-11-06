@@ -20,7 +20,7 @@ pub const NONE: u32 = u32::MAX;
 pub const STATUSES: [&str; 6] = ["Draft", "In Review", "Approved", "Implemented", "Verified", "Rejected"];
 pub const PRIORITIES: [&str; 4] = ["Critical", "High", "Medium", "Low"];
 
-fn status_ix(s: &str) -> u8 {
+pub fn status_ix(s: &str) -> u8 {
     STATUSES
         .iter()
         .position(|x| x.eq_ignore_ascii_case(s))
@@ -28,7 +28,7 @@ fn status_ix(s: &str) -> u8 {
         .unwrap_or(u8::MAX)
 }
 
-fn priority_ix(s: &str) -> u8 {
+pub fn priority_ix(s: &str) -> u8 {
     PRIORITIES
         .iter()
         .position(|x| x.eq_ignore_ascii_case(s))
@@ -104,6 +104,7 @@ pub struct Progress {
 
 // ----------------------------------------------------------- dataset ----
 
+#[derive(Clone)]
 pub struct Req {
     pub id: SharedString,
     pub title: SharedString,

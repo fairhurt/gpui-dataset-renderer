@@ -7,11 +7,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, BoxShadow, Context, Div, FocusHandle, FontWeight, KeyDownEvent, SharedString, Window, div, list,
-    point, prelude::*, px, uniform_list,
+    AnyElement, BoxShadow, ClipboardItem, Context, Div, Entity, FocusHandle, FontWeight, KeyDownEvent, SharedString,
+    Subscription, Window, div, list, point, prelude::*, px, uniform_list,
+};
+use gpui_component::{
+    IconName, WindowExt as _, h_resizable,
+    menu::{ContextMenuExt as _, PopupMenuItem},
+    notification::Notification,
+    resizable_panel,
 };
 
 use crate::data::{self, Dataset, PRIORITIES, Progress, STATUSES, Source, synth::Synth};
+use crate::editor::{EditorEvent, Pane, XmlEditor};
 use crate::explorer::Explorer;
 use crate::html_render::render_blocks;
 use crate::theme::*;
@@ -34,6 +41,8 @@ const W_UPDATED: f32 = 96.0;
 pub struct Options {
     pub count: u32,
     pub dir: Option<PathBuf>,
+    /// Requirement ID to open in the editor once the dataset is loaded.
+    pub edit: Option<String>,
 }
 
 type LoadSlot = Arc<Mutex<Option<Result<Dataset, String>>>>;
@@ -52,12 +61,16 @@ pub struct ReqApp {
     error: Option<String>,
     ex: Option<Explorer>,
     total_load: f32,
+    editor: Option<Entity<XmlEditor>>,
+    _editor_sub: Option<Subscription>,
+    pending_edit: Option<String>,
 }
 
 impl ReqApp {
     pub fn new(opts: Options, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let opts_edit = opts.edit.clone();
         let focus = cx.focus_handle();
-        window.focus(&focus);
+        window.focus(&focus, cx);
 
         let progress = Arc::new(Progress::default());
         let slot: LoadSlot = Arc::new(Mutex::new(None));
@@ -86,6 +99,9 @@ impl ReqApp {
             error: None,
             ex: None,
             total_load: 0.0,
+            editor: None,
+            _editor_sub: None,
+            pending_edit: opts_edit,
         }
     }
 
@@ -104,7 +120,110 @@ impl ReqApp {
 
     // ------------------------------------------------------------ actions
 
+    // ------------------------------------------------------------- editor
+
+    /// Opens the XML editor on `node`, asking first if another document has unsaved edits.
+    pub fn open_editor(&mut self, node: u32, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ed) = &self.editor {
+            let (same, dirty, cur) = {
+                let e = ed.read(cx);
+                (e.node == node, e.is_dirty(), e.id.clone())
+            };
+            if same {
+                ed.update(cx, |e, cx| e.set_pane(pane, window, cx));
+                return;
+            }
+            if dirty {
+                let weak = cx.entity().downgrade();
+                let next = self.ex.as_ref().map(|ex| ex.req(node).id.clone()).unwrap_or_default();
+                window.open_alert_dialog(cx, move |alert, _, _| {
+                    let weak = weak.clone();
+                    alert
+                        .title("Discard unsaved changes?")
+                        .description(format!("{cur} has unsaved edits. Opening {next} discards them."))
+                        .show_cancel(true)
+                        .ok_text("Discard and open")
+                        .on_ok(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| this.force_open_editor(node, pane, window, cx));
+                            true
+                        })
+                });
+                return;
+            }
+        }
+        self.force_open_editor(node, pane, window, cx);
+    }
+
+    fn force_open_editor(&mut self, node: u32, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ex) = self.ex.as_mut() else { return };
+        let docs = ex.original_xml(node).and_then(|o| ex.current_xml(node).map(|c| (o, c)));
+        let (original, current) = match docs {
+            Ok(d) => d,
+            Err(e) => {
+                window.push_notification(Notification::error(format!("Cannot open: {e}")), cx);
+                return;
+            }
+        };
+        let id = ex.req(node).id.clone();
+        let ds = ex.ds.clone();
+        ex.selected = Some(node);
+        ex.reveal_in_tree(node);
+        if let Some(ix) = ex.row_of(node) {
+            ex.list.scroll_to_reveal_item(ix);
+        }
+        let ed = cx.new(|cx| XmlEditor::new(node, id, original, current, ds, pane, window, cx));
+        self._editor_sub = Some(cx.subscribe_in(&ed, window, Self::on_editor_event));
+        ed.update(cx, |e, cx| e.focus_editor(cx));
+        self.editor = Some(ed);
+        cx.notify();
+    }
+
+    fn on_editor_event(&mut self, ed: &Entity<XmlEditor>, ev: &EditorEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev {
+            EditorEvent::Save { node, xml } => {
+                let Some(ex) = self.ex.as_mut() else { return };
+                match ex.save_edit(*node, xml.clone()) {
+                    Ok(()) => {
+                        let id = ex.req(*node).id.clone();
+                        ed.update(cx, |e, cx| e.mark_saved(xml.clone(), cx));
+                        window.push_notification(Notification::success(format!("Saved {id} (in memory).")), cx);
+                    }
+                    Err(e) => window.push_notification(Notification::error(format!("Not saved: {e}")), cx),
+                }
+            }
+            EditorEvent::RevertToOriginal { node } => self.revert_node(*node, window, cx),
+            EditorEvent::Close => {
+                self.editor = None;
+                self._editor_sub = None;
+                window.focus(&self.focus, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn revert_node(&mut self, node: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ex) = self.ex.as_mut() else { return };
+        let was_edited = ex.is_edited(node);
+        let original = ex.original_xml(node);
+        ex.revert(node);
+        ex.apply_filter();
+        if let (Some(ed), Ok(original)) = (&self.editor, original) {
+            if ed.read(cx).node == node {
+                ed.update(cx, |e, cx| e.reload(original, window, cx));
+            }
+        }
+        if was_edited {
+            let id = ex.req(node).id.clone();
+            window.push_notification(Notification::info(format!("Reverted {id} to the source document.")), cx);
+        }
+        cx.notify();
+    }
+
     fn on_root_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Only when the table itself has focus: typing in the editor must not drive the table.
+        if !self.focus.is_focused(window) {
+            return;
+        }
         let Some(ex) = self.ex.as_mut() else { return };
         let ks = &ev.keystroke;
         match ks.key.as_str() {
@@ -127,8 +246,8 @@ impl ReqApp {
                 }
             }
             "escape" => ex.collapse_all_rows(),
-            "/" => window.focus(&self.search_focus),
-            "f" if ks.modifiers.control || ks.modifiers.platform => window.focus(&self.search_focus),
+            "/" => window.focus(&self.search_focus, cx),
+            "f" if ks.modifiers.control || ks.modifiers.platform => window.focus(&self.search_focus, cx),
             _ => return,
         }
         cx.notify();
@@ -148,7 +267,7 @@ impl ReqApp {
             }
             "escape" => {
                 if ex.query.is_empty() {
-                    window.focus(&self.focus);
+                    window.focus(&self.focus, cx);
                 } else {
                     ex.query.clear();
                 }
@@ -158,7 +277,7 @@ impl ReqApp {
                     ex.show(first, true);
                     ex.reveal_in_tree(first);
                 }
-                window.focus(&self.focus);
+                window.focus(&self.focus, cx);
                 cx.stop_propagation();
                 cx.notify();
                 return;
@@ -250,8 +369,8 @@ impl ReqApp {
         let crumbs: Vec<SharedString> = ex
             .selected
             .map(|s| {
-                let mut v: Vec<SharedString> = ds.ancestors(s).iter().map(|a| ds.reqs[*a as usize].id.clone()).collect();
-                v.push(ds.reqs[s as usize].id.clone());
+                let mut v: Vec<SharedString> = ds.ancestors(s).iter().map(|a| ex.req(*a).id.clone()).collect();
+                v.push(ex.req(s).id.clone());
                 v
             })
             .unwrap_or_default();
@@ -306,6 +425,13 @@ impl ReqApp {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .when(!ex.edits.is_empty(), |d| {
+                        d.child(
+                            ui::badge(format!("{} edited in memory", ex.edits.len()))
+                                .text_color(chart(3))
+                                .child(ui::dot(chart(3))),
+                        )
+                    })
                     .child(ui::badge(format!("{} requirements", ui_int(ds.len()))).font_family(MONO))
                     .child(ui::badge(format!("ready in {:.2}s", self.total_load)).font_family(MONO).child(ui::dot(chart(1))))
                     .child(ui::badge(RENDERER).bg(muted()).border_color(gpui::transparent_black())),
@@ -375,7 +501,7 @@ impl ReqApp {
                     count,
                     cx.processor(|this, range: Range<usize>, _window, cx| this.render_tree_rows(range, cx)),
                 )
-                .track_scroll(ex.tree_scroll.clone())
+                .track_scroll(&ex.tree_scroll)
                 .flex_1()
                 .px_2()
                 .py_1(),
@@ -388,7 +514,8 @@ impl ReqApp {
         range
             .filter_map(|ix| ex.tree_rows.get(ix).copied())
             .map(|node| {
-                let r = &ds.reqs[node as usize];
+                let r = ex.req(node);
+                let edited = ex.is_edited(node);
                 let depth = ds.depth[node as usize] as f32;
                 let has_kids = ds.has_children(node);
                 let open = ex.open[node as usize];
@@ -436,7 +563,7 @@ impl ReqApp {
                             .flex_shrink_0()
                             .font_family(MONO)
                             .text_xs()
-                            .text_color(if selected { foreground() } else { muted_foreground() })
+                            .text_color(if edited { chart(3) } else if selected { foreground() } else { muted_foreground() })
                             .child(r.id.clone()),
                     )
                     .child(div().flex_1().min_w(px(0.)).truncate().child(r.title.clone()))
@@ -461,7 +588,7 @@ impl ReqApp {
                             }
                             ex.show(node, true);
                         }
-                        window.focus(&this.focus);
+                        window.focus(&this.focus, cx);
                         cx.notify();
                     }))
                     .into_any_element()
@@ -480,6 +607,17 @@ impl ReqApp {
                 counts[r.status as usize] += 1;
             }
         }
+        for (&n, e) in &ex.edits {
+            let before = ex.ds.reqs[n as usize].status as usize;
+            if before < counts.len() {
+                counts[before] -= 1;
+            }
+            if (e.req.status as usize) < counts.len() {
+                counts[e.req.status as usize] += 1;
+            }
+        }
+        let n_edits = ex.edits.len();
+        let edited_only = ex.edited_only;
 
         let search = div()
             .id("search")
@@ -501,6 +639,7 @@ impl ReqApp {
                     offset: point(px(0.), px(0.)),
                     blur_radius: px(0.),
                     spread_radius: px(3.),
+                    inset: false,
                 }]
             } else {
                 vec![]
@@ -541,18 +680,19 @@ impl ReqApp {
             })
             .when(!focused && query.is_empty(), |d| d.child(ui::kbd("/")))
             .on_click(cx.listener(|this, _, window, cx| {
-                window.focus(&this.search_focus);
+                window.focus(&this.search_focus, cx);
                 cx.notify();
             }))
             .on_key_down(cx.listener(Self::on_search_key));
 
         let status_filter = ex.status_filter;
         let mut tabs = ui::tabs_list().child(
-            ui::tab_trigger("status-all", status_filter.is_none())
+            ui::tab_trigger("status-all", status_filter.is_none() && !edited_only)
                 .child("All")
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Some(ex) = this.ex.as_mut() {
                         ex.status_filter = None;
+                        ex.edited_only = false;
                         ex.apply_filter();
                     }
                     cx.notify();
@@ -580,9 +720,24 @@ impl ReqApp {
             );
         }
 
+        tabs = tabs.child(
+            ui::tab_trigger("status-edited", edited_only)
+                .child(ui::dot(chart(3)))
+                .child("Edited")
+                .child(div().font_family(MONO).text_color(muted_foreground()).child(n_edits.to_string()))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(ex) = this.ex.as_mut() {
+                        ex.edited_only = !ex.edited_only;
+                        ex.apply_filter();
+                    }
+                    cx.notify();
+                })),
+        );
+
         div()
             .flex()
             .flex_shrink_0()
+            .flex_wrap()
             .items_center()
             .gap_3()
             .child(search)
@@ -604,6 +759,7 @@ impl ReqApp {
     }
 
     fn render_table(&self, cx: &mut Context<Self>) -> Div {
+        let compact = self.editor.is_some();
         let ex = self.ex.as_ref().unwrap();
         let empty = ex.rows.is_empty();
         let head = |w: Option<f32>, label: &'static str| {
@@ -632,14 +788,13 @@ impl ReqApp {
                     .text_color(muted_foreground())
                     .child(div().w(px(W_CHEVRON)).flex_shrink_0())
                     .child(head(Some(W_ID), "ID"))
-                    .child(head(Some(W_SECTION), "Section"))
+                    .when(!compact, |d| d.child(head(Some(W_SECTION), "Section")))
                     .child(head(None, "Title"))
                     .child(head(Some(W_TYPE), "Type"))
                     .child(head(Some(W_STATUS), "Status"))
                     .child(head(Some(W_PRIORITY), "Priority"))
                     .child(head(Some(W_CHILDREN), "Children").text_right())
-                    .child(head(Some(W_OWNER), "Owner"))
-                    .child(head(Some(W_UPDATED), "Updated")),
+                    .when(!compact, |d| d.child(head(Some(W_OWNER), "Owner")).child(head(Some(W_UPDATED), "Updated"))),
             )
             .when(empty, |d| {
                 d.child(
@@ -666,10 +821,14 @@ impl ReqApp {
     }
 
     fn render_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let compact = self.editor.is_some();
         let Some(ex) = self.ex.as_mut() else { return div().into_any_element() };
         let Some(&node) = ex.rows.get(ix) else { return div().into_any_element() };
         let ds = ex.ds.clone();
-        let r = &ds.reqs[node as usize];
+        let r = ex.req(node).clone();
+        let r = &r;
+        let owner = ex.owner(node);
+        let edited = ex.is_edited(node);
         let expanded = ex.expanded.contains(&node);
         let selected = ex.selected == Some(node);
         let depth = ds.depth[node as usize] as f32;
@@ -682,6 +841,7 @@ impl ReqApp {
         let row = div()
             .id(("row", node as usize))
             .flex()
+            .w_full()
             .items_center()
             .h(px(ROW_H))
             .px_2()
@@ -703,8 +863,20 @@ impl ReqApp {
                         14.,
                     )),
             )
-            .child(cell(W_ID).font_family(MONO).text_xs().child(r.id.clone()))
-            .child(cell(W_SECTION).font_family(MONO).text_xs().text_color(muted_foreground()).child(ds.section[node as usize].clone()))
+            .child(
+                cell(W_ID)
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .font_family(MONO)
+                    .text_xs()
+                    .when(edited, |d| d.text_color(chart(3)))
+                    .child(r.id.clone())
+                    .when(edited, |d| d.child(ui::dot(chart(3)))),
+            )
+            .when(!compact, |d| {
+                d.child(cell(W_SECTION).font_family(MONO).text_xs().text_color(muted_foreground()).child(ds.section[node as usize].clone()))
+            })
             .child(
                 div()
                     .flex_1()
@@ -735,16 +907,69 @@ impl ReqApp {
                     .text_color(if n_children > 0 { foreground() } else { alpha(muted_foreground(), 0.5) })
                     .child(if n_children > 0 { n_children.to_string() } else { "—".into() }),
             )
-            .child(cell(W_OWNER).text_color(muted_foreground()).child(ds.owners[r.owner as usize].clone()))
-            .child(cell(W_UPDATED).font_family(MONO).text_xs().text_color(muted_foreground()).child(r.updated.clone()))
+            .when(!compact, |d| {
+                d.child(cell(W_OWNER).text_color(muted_foreground()).child(owner.clone()))
+                    .child(cell(W_UPDATED).font_family(MONO).text_xs().text_color(muted_foreground()).child(r.updated.clone()))
+            })
             .on_click(cx.listener(move |this, _, window, cx| {
                 if let Some(ex) = this.ex.as_mut() {
                     ex.toggle_row(node);
                     ex.reveal_in_tree(node);
                 }
-                window.focus(&this.focus);
+                window.focus(&this.focus, cx);
                 cx.notify();
             }));
+
+        let weak = cx.entity().downgrade();
+        let row_id = r.id.clone();
+        let row = row.context_menu(move |menu, _window, _cx| {
+            let open = |label: &'static str, icon: IconName, pane: Pane| {
+                let weak = weak.clone();
+                PopupMenuItem::new(label).icon(icon).on_click(move |_, window, cx| {
+                    let _ = weak.update(cx, |this, cx| this.open_editor(node, pane, window, cx));
+                })
+            };
+            let weak2 = weak.clone();
+            let weak3 = weak.clone();
+            let weak4 = weak.clone();
+            let id = row_id.clone();
+            menu.item(open("Edit XML", IconName::FileText, Pane::Xml))
+                .item(open("View changes", IconName::Replace, Pane::Changes).disabled(!edited))
+                .item(open("Preview description", IconName::Eye, Pane::Preview))
+                .separator()
+                .item(
+                    PopupMenuItem::new("Revert to original")
+                        .icon(IconName::Undo2)
+                        .disabled(!edited)
+                        .on_click(move |_, window, cx| {
+                            let _ = weak2.update(cx, |this, cx| this.revert_node(node, window, cx));
+                        }),
+                )
+                .separator()
+                .item(PopupMenuItem::new(if expanded { "Collapse row" } else { "Expand row" }).on_click(
+                    move |_, _, cx| {
+                        let _ = weak3.update(cx, |this, cx| {
+                            if let Some(ex) = this.ex.as_mut() {
+                                ex.toggle_row(node);
+                            }
+                            cx.notify();
+                        });
+                    },
+                ))
+                .item(PopupMenuItem::new("Reveal in outline").icon(IconName::Map).on_click(move |_, _, cx| {
+                    let _ = weak4.update(cx, |this, cx| {
+                        if let Some(ex) = this.ex.as_mut() {
+                            ex.selected = Some(node);
+                            ex.reveal_in_tree(node);
+                        }
+                        cx.notify();
+                    });
+                }))
+                .item(PopupMenuItem::new("Copy ID").icon(IconName::Copy).on_click(move |_, window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(id.to_string()));
+                    window.push_notification(Notification::info(format!("Copied {id}")), cx);
+                }))
+        });
 
         if !expanded {
             return row.into_any_element();
@@ -805,6 +1030,7 @@ impl ReqApp {
 
         let detail = div()
             .flex()
+            .w_full()
             .gap_6()
             .px_6()
             .py_5()
@@ -833,7 +1059,31 @@ impl ReqApp {
                                     .child(ui::badge(status_name).child(ui::dot(status_color(r.status))))
                                     .child(ui::badge(priority_name).text_color(priority_color(r.priority)))
                                     .child(ui::badge(r.kind.clone()))
-                                    .child(ui::badge(format!("v{}", r.version)).font_family(MONO)),
+                                    .child(ui::badge(format!("v{}", r.version)).font_family(MONO))
+                                    .when(edited, |d| d.child(ui::badge("edited").text_color(chart(3)).child(ui::dot(chart(3)))))
+                                    .child(div().flex_1())
+                                    .child(
+                                        ui::button(("edit-xml", node as usize), Variant::Outline)
+                                            .h(px(26.))
+                                            .text_xs()
+                                            .child("Edit XML")
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.open_editor(node, Pane::Xml, window, cx)
+                                            })),
+                                    )
+                                    .when(edited, |d| {
+                                        d.child(
+                                            ui::button(("view-changes", node as usize), Variant::Ghost)
+                                                .h(px(26.))
+                                                .text_xs()
+                                                .child("View changes")
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.open_editor(node, Pane::Changes, window, cx)
+                                                })),
+                                        )
+                                    }),
                             )
                             .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(r.title.clone())),
                     )
@@ -905,13 +1155,13 @@ impl ReqApp {
                             .child(meta("HTML (CDATA)", ui_bytes(body.html_bytes as u64)))
                             .child(meta("Blocks", body.blocks.len().to_string()))
                             .child(meta("Load + parse", format!("{:.0} µs", body.parse_time.as_secs_f64() * 1e6)))
-                            .child(meta("Owner", ds.owners[r.owner as usize].to_string()))
+                            .child(meta("Owner", owner.to_string()))
                             .child(meta("Updated", r.updated.to_string()))
                             .child(meta("Section", ds.section[node as usize].to_string())),
                     ),
             );
 
-        div().flex().flex_col().child(row).child(detail).into_any_element()
+        div().flex().flex_col().w_full().child(row).child(detail).into_any_element()
     }
 
     fn render_status_bar(&self) -> Div {
@@ -957,6 +1207,39 @@ impl ReqApp {
             .child(div().flex().items_center().gap_1().child(ui::kbd("↑↓")).child("navigate"))
             .child(div().flex().items_center().gap_1().child(ui::kbd("Enter")).child("expand"))
             .child(div().flex().items_center().gap_1().child(ui::kbd("Esc")).child("collapse all"))
+            .child(div().flex().items_center().gap_1().child(ui::kbd("Right-click")).child("edit / diff"))
+    }
+}
+
+impl ReqApp {
+    fn render_main(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let table = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_w(px(0.))
+            .gap_3()
+            .p_4()
+            .child(self.render_toolbar(window, cx))
+            .child(self.render_table(cx));
+        match &self.editor {
+            None => div().flex().flex_1().min_w(px(0.)).child(table).into_any_element(),
+            Some(ed) => div()
+                .flex()
+                .flex_1()
+                .min_w(px(0.))
+                .child(
+                    h_resizable("main-split")
+                        .child(resizable_panel().child(table))
+                        .child(
+                            resizable_panel()
+                                .size(px(620.))
+                                .size_range(px(420.)..px(1600.))
+                                .child(div().size_full().border_l_1().border_color(border()).child(ed.clone())),
+                        ),
+                )
+                .into_any_element(),
+        }
     }
 }
 
@@ -970,6 +1253,13 @@ impl Render for ReqApp {
             self.poll_loading();
             if self.loading.is_some() {
                 window.request_animation_frame();
+            }
+        }
+        if let Some(id) = self.ex.is_some().then(|| self.pending_edit.take()).flatten() {
+            let node = self.ex.as_ref().and_then(|ex| ex.ds.by_id.get(id.as_str()).copied());
+            match node {
+                Some(node) => self.open_editor(node, Pane::Xml, window, cx),
+                None => window.push_notification(Notification::error(format!("--edit: no requirement {id}")), cx),
             }
         }
         if self.ex.is_none() {
@@ -991,17 +1281,7 @@ impl Render for ReqApp {
                     .flex_1()
                     .min_h(px(0.))
                     .child(self.render_sidebar(cx))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .gap_3()
-                            .p_4()
-                            .child(self.render_toolbar(window, cx))
-                            .child(self.render_table(cx)),
-                    ),
+                    .child(self.render_main(window, cx)),
             )
             .child(self.render_status_bar())
             .on_key_down(cx.listener(Self::on_root_key))

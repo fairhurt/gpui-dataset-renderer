@@ -5,6 +5,7 @@
 
 mod app;
 mod data;
+mod editor;
 mod explorer;
 mod html;
 mod html_render;
@@ -13,7 +14,7 @@ mod ui;
 
 use std::path::PathBuf;
 
-use gpui::{App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui::{App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 const USAGE: &str = "\
 gpui-dataset-renderer — requirements explorer
@@ -21,6 +22,7 @@ gpui-dataset-renderer — requirements explorer
 USAGE:
     gpui-dataset-renderer [--count N]       generate N synthetic XML requirements in memory (default 150000)
     gpui-dataset-renderer --dir <folder>    load every *.xml file in <folder>
+    gpui-dataset-renderer --edit <ID>       open the XML editor on requirement <ID> once loaded
     gpui-dataset-renderer --write <folder> [--count N]
                                             write the synthetic dataset to disk as one XML file per requirement";
 
@@ -45,6 +47,7 @@ fn main() {
     let mut count: u32 = 150_000;
     let mut dir: Option<PathBuf> = None;
     let mut write: Option<PathBuf> = None;
+    let mut edit: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -57,6 +60,7 @@ fn main() {
             }
             "--dir" | "-d" => dir = args.next().map(PathBuf::from),
             "--write" | "-w" => write = args.next().map(PathBuf::from),
+            "--edit" | "-e" => edit = args.next(),
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return;
@@ -77,7 +81,11 @@ fn main() {
         return;
     }
 
-    Application::new().run(move |cx: &mut App| {
+    gpui_platform::application().with_assets(gpui_kit_assets::Assets).run(move |cx: &mut App| {
+        gpui_component::init(cx);
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+        editor::init(cx);
+        editor::register_xml_language();
         let bounds = Bounds::centered(None, size(px(1640.), px(1000.)), cx);
         cx.open_window(
             WindowOptions {
@@ -90,10 +98,14 @@ fn main() {
                 focus: true,
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| app::ReqApp::new(app::Options { count, dir }, window, cx)),
+            |window, cx| {
+                let view = cx.new(|cx| app::ReqApp::new(app::Options { count, dir, edit }, window, cx));
+                // gpui-component's overlays (context menus, popovers, notifications) need a Root.
+                cx.new(|cx| gpui_component::Root::new(view, window, cx))
+            },
         )
         .expect("failed to open window");
-        cx.on_window_closed(|cx| cx.quit()).detach();
+        cx.on_window_closed(|cx, _| cx.quit()).detach();
         cx.activate(true);
     });
 }

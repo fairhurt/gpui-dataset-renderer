@@ -1,8 +1,13 @@
 # gpui-dataset-renderer
 
 Requirements Explorer POC: render a large dataset (up to 150k) of XML requirement
-documents in a GPUI (Zed's Rust GPU UI framework, crate `gpui = 0.2.2`) desktop app
-with a shadcn/ui-style dark theme.
+documents in a GPUI (Zed's Rust GPU UI framework) desktop app with a shadcn/ui-style dark theme.
+
+Dependencies: GPUI comes from `gpui-pre` 0.3.11 (renamed to `gpui` in Cargo.toml) plus
+`gpui-pre-platform` (`gpui_platform::application()`), because `gpui-component` 0.9 (Longbridge's
+component library: code editor, diff, menus, dialogs, notifications, resizable panels) is built on
+it. Icons come from `gpui-kit-assets` (registered with `.with_assets(Assets)`). The window's root
+view must be `gpui_component::Root` for menus/dialogs/notifications to work.
 
 ## The data
 
@@ -30,6 +35,15 @@ with a shadcn/ui-style dark theme.
   height, so a row can expand inline to show the rendered HTML). Clicking a tree item
   selects it, expands its row and scrolls the table to it. Search box is a focusable div
   that captures key events (GPUI 0.2.2 has no built-in text input).
+- `src/editor.rs`: XML editor panel (gpui-component `Editor` + tree-sitter-xml registered as
+  language "xml", with HTML injected into CDATA), live validation (quick-xml well-formedness +
+  requirement schema checks → editor diagnostics + problems list), changes view (`similar` patch →
+  gpui-component `Diff`, unified/split) and a rendered preview. Ctrl+S saves. Has unit tests.
+- Edits are kept in memory only: `Explorer::edits` overlays saved XML on the source, and the
+  table, search, status counts and preview read through `Explorer::req()` / `current_xml()`.
+  Changing `children` does not relink the tree (the indexer owns it); the editor says so.
+- Opening: right-click a table row (context menu), "Edit XML" in an expanded row, or
+  `--edit <ID>` on the command line.
 - `src/ui.rs`, `src/theme.rs`: shadcn-like primitives and zinc dark tokens.
 
 ## Building on Windows
@@ -47,8 +61,9 @@ Windows shell. Not needed when running Claude Code locally; feel free to delete 
 
 ## Status / next steps
 
-- Builds cleanly on Windows (release), `cargo test --release` passes (3 html parser tests),
-  and the app launches with 150k synthetic requirements without errors.
+- Builds cleanly on Windows (release), `cargo test --release` passes (html parser, validator,
+  diff and XML-highlighting tests), and the app launches with 150k synthetic requirements.
+- Release builds use the Windows GUI subsystem (no console window).
 - Pushed to https://github.com/fairhurt/gpui-dataset-renderer (branch `main`).
 - Still to verify by hand in the UI: the tree, table scrolling, clicking a tree item
   (expands + scrolls), HTML tables rendering, search, status filter tabs.
