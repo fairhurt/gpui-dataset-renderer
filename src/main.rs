@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+// Release builds are a GUI app on Windows: no console window pops up next to the UI.
+// Debug builds keep the console for logs.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
 mod data;
@@ -21,7 +24,24 @@ USAGE:
     gpui-dataset-renderer --write <folder> [--count N]
                                             write the synthetic dataset to disk as one XML file per requirement";
 
+/// A GUI-subsystem exe has no console. When launched from a terminal, reattach to it so
+/// `--help`, `--write` progress and errors still print there. No-op when started from Explorer.
+#[cfg(windows)]
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 fn main() {
+    #[cfg(windows)]
+    attach_parent_console();
+
     let mut count: u32 = 150_000;
     let mut dir: Option<PathBuf> = None;
     let mut write: Option<PathBuf> = None;

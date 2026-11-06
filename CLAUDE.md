@@ -37,7 +37,8 @@ with a shadcn/ui-style dark theme.
 GPUI's build script only looks for `fxc.exe` at Windows SDK 10.0.26100.0. This machine has
 10.0.22000.0, so plain `cargo build` fails with "Failed to find fxc.exe". Either:
 
-- use `run.cmd` (finds fxc via `scripts/find-fxc.ps1`, then runs `cargo run --release`), or
+- use `run.cmd` (finds fxc via `scripts/find-fxc.ps1`, runs `cargo build --release`, then
+  starts the exe detached), or
 - set `GPUI_FXC_PATH` first, e.g. in PowerShell:
   `$env:GPUI_FXC_PATH = & .\scripts\find-fxc.ps1; cargo build --release`
 

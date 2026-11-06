@@ -9,5 +9,10 @@ if not defined GPUI_FXC_PATH (
   pause
   exit /b 1
 )
-cargo run --release -- %*
-if errorlevel 1 pause
+cargo build --release
+if errorlevel 1 (
+  pause
+  exit /b 1
+)
+rem Start the GUI detached so this console window closes.
+start "" "%~dp0target\release\gpui-dataset-renderer.exe" %*
