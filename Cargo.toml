@@ -1,0 +1,19 @@
+[package]
+name = "gpui-dataset-renderer"
+version = "0.1.0"
+edition = "2024"
+description = "Requirements explorer: 150k XML requirements with HTML-in-CDATA, rendered with GPUI"
+
+[dependencies]
+gpui = "0.2.2"
+quick-xml = "0.37"
+rayon = "1.10"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+debug = 1
